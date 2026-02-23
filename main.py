@@ -168,10 +168,12 @@ def chat(req: ChatRequest):
         return handle_today(req)
     elif msg == "/help":
         return handle_help()
+    elif msg.startswith("reply_select|"):
+        return handle_reply_select(req, session)
+    elif msg.startswith("reply_confirm|"):
+        return handle_reply_confirm(req, session)
     elif step == "search_waiting":
         return handle_search(req, req.message)
-    elif step == "reply_select":
-        return handle_reply_select(req, session)
     elif step == "reply_instruction":
         return handle_reply_instruction(req, session)
     else:
@@ -286,7 +288,7 @@ def handle_reply_start(req: ChatRequest) -> ChatResponse:
 
 def handle_reply_select(req: ChatRequest, session: dict) -> ChatResponse:
     try:
-        index = int(req.message.split("|")[1]) if "|" in req.message else int(req.message) - 1
+        index = int(req.message.split("|")[1])
         emails = json.loads(session.get("emails") or "[]")
         selected = emails[index]
         save_session(req.chat_id, step="reply_instruction", selected_email=json.dumps(selected))
@@ -327,6 +329,26 @@ def handle_reply_instruction(req: ChatRequest, session: dict) -> ChatResponse:
         ]],
         action="confirm_reply",
         action_data={"email_id": selected.get("id"), "draft": draft}
+    )
+
+
+def handle_reply_confirm(req: ChatRequest, session: dict) -> ChatResponse:
+    action = req.message.split("|")[1] if "|" in req.message else ""
+    if action == "no":
+        save_session(req.chat_id, step="idle", draft=None, selected_email=None)
+        return ChatResponse(type="text", text="❌ Brouillon annulé.")
+    selected = json.loads(session.get("selected_email") or "{}")
+    draft = session.get("draft", "")
+    save_session(req.chat_id, step="idle", draft=None, selected_email=None)
+    return ChatResponse(
+        type="action",
+        text="✅ Envoi en cours...",
+        action="send_email",
+        action_data={
+            "email_id": selected.get("id"),
+            "thread_id": selected.get("threadId"),
+            "draft": draft
+        }
     )
 
 
