@@ -90,6 +90,12 @@ def call_groq(system_prompt: str, user_prompt: str) -> dict:
     }
     r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=60)
     data = r.json()
+
+    if "error" in data:
+        raise RuntimeError(f"Groq error: {data['error']}")
+    if "choices" not in data:
+        raise RuntimeError(f"Groq missing choices: {data}")
+
     content = data["choices"][0]["message"]["content"].strip()
     if "```json" in content:
         content = content.split("```json")[1].split("```")[0].strip()
@@ -189,11 +195,16 @@ def handle_help() -> ChatResponse:
 
 def handle_inbox(req: ChatRequest) -> ChatResponse:
     if not req.emails:
-        return ChatResponse(type="action", text="", action="get_emails", action_data={"filter": "inbox"})
+        return ChatResponse(
+            type="action",
+            text="",
+            action="get_emails",
+            action_data={"filter": "inbox"}
+        )
     system_prompt = (
         "Analyse ces emails et réponds en JSON : "
         "`summary` (string), `urgent` (array), `tasks` (array). "
-        "JSON brut uniquement."
+        "JSON brut uniquement, aucun texte avant ou après."
     )
     parsed = call_groq(system_prompt, emails_to_text(req.emails))
     urgent = "\n".join([f"🔥 {u}" for u in parsed.get("urgent", [])]) or "Aucun"
@@ -206,7 +217,12 @@ def handle_inbox(req: ChatRequest) -> ChatResponse:
 
 def handle_important(req: ChatRequest) -> ChatResponse:
     if not req.emails:
-        return ChatResponse(type="action", text="", action="get_emails", action_data={"filter": "important"})
+        return ChatResponse(
+            type="action",
+            text="",
+            action="get_emails",
+            action_data={"filter": "important"}
+        )
     system_prompt = (
         "Identifie les emails vraiment importants (pas pubs ni newsletters). "
         "Réponds en JSON : `summary` (string), `emails` (array de strings). "
@@ -227,7 +243,12 @@ def handle_search_start(chat_id: int) -> ChatResponse:
 
 def handle_search(req: ChatRequest, query: str) -> ChatResponse:
     if not req.emails:
-        return ChatResponse(type="action", text="", action="get_emails", action_data={"filter": query})
+        return ChatResponse(
+            type="action",
+            text="",
+            action="get_emails",
+            action_data={"filter": query}
+        )
     system_prompt = (
         f"Recherche les emails correspondant à : '{query}'. "
         "Réponds en JSON : `results` (array de strings), `summary` (string). "
@@ -244,7 +265,12 @@ def handle_search(req: ChatRequest, query: str) -> ChatResponse:
 
 def handle_reply_start(req: ChatRequest) -> ChatResponse:
     if not req.emails:
-        return ChatResponse(type="action", text="", action="get_emails", action_data={"filter": "inbox"})
+        return ChatResponse(
+            type="action",
+            text="",
+            action="get_emails",
+            action_data={"filter": "inbox"}
+        )
     emails = req.emails[:10]
     save_session(req.chat_id, step="reply_select", emails=json.dumps([e.dict() for e in emails]))
     buttons = [[{
@@ -306,7 +332,12 @@ def handle_reply_instruction(req: ChatRequest, session: dict) -> ChatResponse:
 
 def handle_today(req: ChatRequest) -> ChatResponse:
     if not req.events:
-        return ChatResponse(type="action", text="", action="get_calendar", action_data={"range": "today"})
+        return ChatResponse(
+            type="action",
+            text="",
+            action="get_calendar",
+            action_data={"range": "today"}
+        )
     events_text = "\n".join([
         f"- {e.get('summary', 'Sans titre')} à {e.get('start', '')}"
         for e in req.events
