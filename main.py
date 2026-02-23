@@ -150,6 +150,8 @@ def chat(req: ChatRequest):
     step = session.get("step", "idle")
     msg = req.message.strip().lower()
 
+    print(f"DEBUG: msg={msg}, step={step}, session={session}")
+
     if msg.startswith("/"):
         save_session(req.chat_id, step="idle", selected_email=None, draft=None)
         step = "idle"
@@ -302,7 +304,8 @@ def handle_reply_select(req: ChatRequest, session: dict) -> ChatResponse:
                 f"Ex: \"Réponds poliment que je suis absent\""
             )
         )
-    except Exception:
+    except Exception as e:
+        print(f"DEBUG handle_reply_select error: {e}")
         return ChatResponse(type="text", text="❌ Sélection invalide. Tape le numéro de l'email.")
 
 
