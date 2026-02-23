@@ -111,6 +111,14 @@ def emails_to_text(emails: List[Email]) -> str:
     return text
 
 
+def parse_session_json(value, default):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
 # ─── Session ────────────────────────────────────────────────
 def get_session(chat_id: int) -> dict:
     conn = get_db()
@@ -149,8 +157,6 @@ def chat(req: ChatRequest):
     session = get_session(req.chat_id)
     step = session.get("step", "idle")
     msg = req.message.strip().lower()
-
-    print(f"DEBUG: msg={msg}, step={step}, session={session}")
 
     if msg.startswith("/"):
         save_session(req.chat_id, step="idle", selected_email=None, draft=None)
@@ -291,7 +297,7 @@ def handle_reply_start(req: ChatRequest) -> ChatResponse:
 def handle_reply_select(req: ChatRequest, session: dict) -> ChatResponse:
     try:
         index = int(req.message.split("|")[1])
-        emails = json.loads(session.get("emails") or "[]")
+        emails = parse_session_json(session.get("emails"), [])
         selected = emails[index]
         save_session(req.chat_id, step="reply_instruction", selected_email=json.dumps(selected))
         return ChatResponse(
@@ -310,7 +316,7 @@ def handle_reply_select(req: ChatRequest, session: dict) -> ChatResponse:
 
 
 def handle_reply_instruction(req: ChatRequest, session: dict) -> ChatResponse:
-    selected = json.loads(session.get("selected_email") or "{}")
+    selected = parse_session_json(session.get("selected_email"), {})
     system_prompt = (
         "Tu es un assistant email professionnel. Rédige une réponse email. "
         "Réponds en JSON : `draft` (string, texte complet). JSON brut uniquement."
@@ -340,7 +346,7 @@ def handle_reply_confirm(req: ChatRequest, session: dict) -> ChatResponse:
     if action == "no":
         save_session(req.chat_id, step="idle", draft=None, selected_email=None)
         return ChatResponse(type="text", text="❌ Brouillon annulé.")
-    selected = json.loads(session.get("selected_email") or "{}")
+    selected = parse_session_json(session.get("selected_email"), {})
     draft = session.get("draft", "")
     save_session(req.chat_id, step="idle", draft=None, selected_email=None)
     return ChatResponse(
