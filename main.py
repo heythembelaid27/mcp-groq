@@ -1,23 +1,39 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Any
 import requests
 import json
 import os
 import psycopg2
+import xml.etree.ElementTree as ET
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
 
 # ─── Config ─────────────────────────────────────────────────
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama-3.3-70b-versatile"
-DATABASE_URL = os.getenv("DATABASE_URL")
+GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
+GROQ_URL            = "https://api.groq.com/openai/v1/chat/completions"
+MODEL               = "llama-3.3-70b-versatile"
+DATABASE_URL        = os.getenv("DATABASE_URL")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
-DEFAULT_CITY = "Paris"
+API_SECRET          = os.getenv("API_SECRET")
+DEFAULT_CITY        = "Paris"
+GOOGLE_NEWS_RSS     = "https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr"
+GOOGLE_NEWS_SEARCH_RSS = "https://news.google.com/rss/search?hl=fr&gl=FR&ceid=FR:fr&q={query}"
 
 app = FastAPI()
+
+
+# ─── Middleware : vérification header secret ─────────────────
+@app.middleware("http")
+async def check_secret(request: Request, call_next):
+    if request.url.path == "/health":
+        return await call_next(request)
+    if API_SECRET:
+        token = request.headers.get("X-API-Secret", "")
+        if token != API_SECRET:
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 
 # ─── Postgres ───────────────────────────────────────────────
@@ -179,20 +195,35 @@ def weather_emoji(condition: str) -> str:
     return "🌤️"
 
 
-# ─── News ───────────────────────────────────────────────────
-def fetch_news(topic: str = "", lang: str = "fr", max_results: int = 5) -> list:
-    url = "https://gnews.io/api/v4/top-headlines"
-    params = {
-        "token": GNEWS_API_KEY,
-        "lang": lang,
-        "max": max_results,
-    }
+# ─── News (Google News RSS) ─────────────────────────────────
+def fetch_news(topic: str = "", max_results: int = 5) -> list:
     if topic:
-        url = "https://gnews.io/api/v4/search"
-        params["q"] = topic
-    r = requests.get(url, params=params, timeout=10)
-    data = r.json()
-    return data.get("articles", [])
+        url = GOOGLE_NEWS_SEARCH_RSS.format(query=requests.utils.quote(topic))
+    else:
+        url = GOOGLE_NEWS_RSS
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+
+    root = ET.fromstring(r.content)
+    channel = root.find("channel")
+    items = channel.findall("item") if channel is not None else []
+
+    articles = []
+    for item in items[:max_results]:
+        title = item.findtext("title", "Sans titre")
+        link = item.findtext("link", "")
+        source_el = item.find("source")
+        source = source_el.text if source_el is not None else "Google News"
+        pub_date = item.findtext("pubDate", "")
+        articles.append({
+            "title": title,
+            "url": link,
+            "source": source,
+            "pubDate": pub_date
+        })
+    return articles
 
 
 # ─── Health ─────────────────────────────────────────────────
@@ -226,16 +257,6 @@ def chat(req: ChatRequest):
         return handle_reply_start(req)
     elif msg == "/today":
         return handle_today(req)
-    elif msg == "/weather":
-        return handle_weather(DEFAULT_CITY)
-    elif msg.startswith("/weather "):
-        city = req.message[9:].strip()
-        return handle_weather(city)
-    elif msg == "/news":
-        return handle_news("")
-    elif msg.startswith("/news "):
-        topic = req.message[6:].strip()
-        return handle_news(topic)
     elif msg == "/help":
         return handle_help()
     elif msg.startswith("reply_select|"):
@@ -267,15 +288,11 @@ def handle_help() -> ChatResponse:
         type="text",
         text=(
             "🤖 *Commandes disponibles :*\n\n"
+            "📅 /today — Briefing du jour (météo + agenda + actus)\n"
             "📬 /inbox — Résumé de ta boîte mail\n"
             "⭐ /important — Emails importants\n"
             "🔍 /search — Rechercher un email\n"
             "✉️ /reply — Répondre à un email\n"
-            "📅 /today — Agenda du jour\n"
-            "🌤️ /weather — Météo à Paris\n"
-            "🌤️ /weather Lyon — Météo d'une ville\n"
-            "📰 /news — Actualités du jour\n"
-            "📰 /news IA — Actualités sur un sujet\n"
         )
     )
 
@@ -451,38 +468,72 @@ def handle_reply_confirm(req: ChatRequest, session: dict) -> ChatResponse:
 
 
 def handle_today(req: ChatRequest) -> ChatResponse:
-    if not req.events:
+    # Étape 1 — demander le calendar à n8n
+    if req.events is None:
         return ChatResponse(
             type="action",
             text="",
             action="get_calendar",
             action_data={"range": "today"}
         )
-    if not req.events:
-        return ChatResponse(type="text", text="📅 *Agenda du jour :*\n\nAucun événement aujourd'hui 🎉")
 
-    lines = []
-    for e in req.events:
-        title = e.get("summary", "Sans titre")
-        start = e.get("start", {})
-        # Handle both datetime and all-day events
-        if isinstance(start, dict):
-            time_str = start.get("dateTime", start.get("date", ""))
+    # Étape 2 — on a les events, on assemble météo + news + calendar ici
+    now = datetime.now()
+    days_fr   = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"]
+    months_fr = ["janvier","février","mars","avril","mai","juin",
+                 "juillet","août","septembre","octobre","novembre","décembre"]
+    date_str = f"{days_fr[now.weekday()]} {now.day} {months_fr[now.month-1]} {now.year}"
+
+    sections = [f"🗓️ *Briefing du jour — {date_str}*"]
+
+    # ── Météo ──────────────────────────────────────────────
+    try:
+        w = fetch_weather(DEFAULT_CITY)
+        if w.get("cod") == 200:
+            temp  = round(w["main"]["temp"])
+            feels = round(w["main"]["feels_like"])
+            desc  = w["weather"][0]["description"].capitalize()
+            wind  = round(w["wind"]["speed"] * 3.6)
+            emoji = weather_emoji(w["weather"][0]["main"])
+            sections.append(
+                f"{emoji} *Météo à {w['name']}*\n"
+                f"{temp}°C (ressenti {feels}°C) — {desc}\n"
+                f"💨 {wind} km/h · 💧 {w['main']['humidity']}%"
+            )
         else:
-            time_str = str(start)
-        # Format time nicely if possible
-        try:
-            dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-            time_display = dt.strftime("%H:%M")
-        except Exception:
-            time_display = time_str
-        lines.append(f"🕐 *{time_display}* — {title}")
+            sections.append("🌤️ *Météo* : données indisponibles")
+    except Exception as e:
+        sections.append(f"🌤️ *Météo* : erreur ({e})")
 
-    events_text = "\n".join(lines)
-    return ChatResponse(
-        type="text",
-        text=f"📅 *Agenda du jour :*\n\n{events_text}"
-    )
+    # ── Agenda ─────────────────────────────────────────────
+    if req.events:
+        lines = []
+        for e in req.events:
+            title = e.get("summary", "Sans titre")
+            start = e.get("start", {})
+            time_str = start.get("dateTime", start.get("date", "")) if isinstance(start, dict) else str(start)
+            try:
+                dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+                time_display = dt.strftime("%H:%M")
+            except Exception:
+                time_display = "toute la journée"
+            lines.append(f"  🕐 *{time_display}* — {title}")
+        sections.append("📅 *Agenda*\n" + "\n".join(lines))
+    else:
+        sections.append("📅 *Agenda* : Aucun événement aujourd'hui 🎉")
+
+    # ── News ───────────────────────────────────────────────
+    try:
+        articles = fetch_news(max_results=4)
+        if articles:
+            lines = [f"  {i}. [{a['title']}]({a['url']})" for i, a in enumerate(articles, 1)]
+            sections.append("📰 *Actus du jour*\n" + "\n".join(lines))
+        else:
+            sections.append("📰 *Actus* : aucune disponible")
+    except Exception as e:
+        sections.append(f"📰 *Actus* : erreur ({e})")
+
+    return ChatResponse(type="text", text="\n\n".join(sections))
 
 
 def handle_weather(city: str) -> ChatResponse:
@@ -515,17 +566,17 @@ def handle_weather(city: str) -> ChatResponse:
 
 def handle_news(topic: str) -> ChatResponse:
     try:
-        articles = fetch_news(topic=topic, lang="fr", max_results=5)
+        articles = fetch_news(topic=topic, max_results=5)
         if not articles:
             return ChatResponse(type="text", text="📰 Aucune actualité trouvée.")
 
-        header = f"📰 *Actualités{' sur ' + topic if topic else ' du jour'} :*\n\n"
+        header = f"📰 *Actualités{' sur *' + topic + '*' if topic else ' du jour'} :*\n\n"
         lines = []
         for i, a in enumerate(articles, start=1):
             title = a.get("title", "Sans titre")
-            source = a.get("source", {}).get("name", "")
+            source = a.get("source", "")
             url = a.get("url", "")
-            lines.append(f"{i}. [{title}]({url})\n   _{source}_")
+            lines.append(f"{i}\\. [{title}]({url})\n   _{source}_")
 
         return ChatResponse(type="text", text=header + "\n\n".join(lines))
     except Exception as e:
