@@ -6,12 +6,16 @@ import json
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from datetime import datetime
 
 # ─── Config ─────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "llama-3.3-70b-versatile"
 DATABASE_URL = os.getenv("DATABASE_URL")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
+DEFAULT_CITY = "Paris"
 
 app = FastAPI()
 
@@ -145,6 +149,52 @@ def save_session(chat_id: int, **kwargs):
     conn.close()
 
 
+# ─── Weather ────────────────────────────────────────────────
+def fetch_weather(city: str) -> dict:
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    params = {
+        "q": city,
+        "appid": OPENWEATHER_API_KEY,
+        "units": "metric",
+        "lang": "fr"
+    }
+    r = requests.get(url, params=params, timeout=10)
+    return r.json()
+
+
+def weather_emoji(condition: str) -> str:
+    condition = condition.lower()
+    if "clear" in condition:
+        return "☀️"
+    elif "cloud" in condition:
+        return "☁️"
+    elif "rain" in condition or "drizzle" in condition:
+        return "🌧️"
+    elif "storm" in condition or "thunder" in condition:
+        return "⛈️"
+    elif "snow" in condition:
+        return "❄️"
+    elif "fog" in condition or "mist" in condition:
+        return "🌫️"
+    return "🌤️"
+
+
+# ─── News ───────────────────────────────────────────────────
+def fetch_news(topic: str = "", lang: str = "fr", max_results: int = 5) -> list:
+    url = "https://gnews.io/api/v4/top-headlines"
+    params = {
+        "token": GNEWS_API_KEY,
+        "lang": lang,
+        "max": max_results,
+    }
+    if topic:
+        url = "https://gnews.io/api/v4/search"
+        params["q"] = topic
+    r = requests.get(url, params=params, timeout=10)
+    data = r.json()
+    return data.get("articles", [])
+
+
 # ─── Health ─────────────────────────────────────────────────
 @app.get("/health")
 def health():
@@ -162,7 +212,9 @@ def chat(req: ChatRequest):
         save_session(req.chat_id, step="idle", selected_email=None, draft=None)
         step = "idle"
 
-    if msg == "/inbox":
+    if msg == "/start":
+        return handle_start()
+    elif msg == "/inbox":
         return handle_inbox(req)
     elif msg == "/important":
         return handle_important(req)
@@ -174,6 +226,16 @@ def chat(req: ChatRequest):
         return handle_reply_start(req)
     elif msg == "/today":
         return handle_today(req)
+    elif msg == "/weather":
+        return handle_weather(DEFAULT_CITY)
+    elif msg.startswith("/weather "):
+        city = req.message[9:].strip()
+        return handle_weather(city)
+    elif msg == "/news":
+        return handle_news("")
+    elif msg.startswith("/news "):
+        topic = req.message[6:].strip()
+        return handle_news(topic)
     elif msg == "/help":
         return handle_help()
     elif msg.startswith("reply_select|"):
@@ -189,6 +251,17 @@ def chat(req: ChatRequest):
 
 
 # ─── Handlers ───────────────────────────────────────────────
+def handle_start() -> ChatResponse:
+    return ChatResponse(
+        type="text",
+        text=(
+            "👋 *Bonjour ! Je suis ton assistant personnel.*\n\n"
+            "Je peux t'aider à gérer tes emails, ton agenda, la météo et les actualités.\n\n"
+            "Tape /help pour voir toutes les commandes disponibles 🚀"
+        )
+    )
+
+
 def handle_help() -> ChatResponse:
     return ChatResponse(
         type="text",
@@ -199,6 +272,10 @@ def handle_help() -> ChatResponse:
             "🔍 /search — Rechercher un email\n"
             "✉️ /reply — Répondre à un email\n"
             "📅 /today — Agenda du jour\n"
+            "🌤️ /weather — Météo à Paris\n"
+            "🌤️ /weather Lyon — Météo d'une ville\n"
+            "📰 /news — Actualités du jour\n"
+            "📰 /news IA — Actualités sur un sujet\n"
         )
     )
 
@@ -211,18 +288,21 @@ def handle_inbox(req: ChatRequest) -> ChatResponse:
             action="get_emails",
             action_data={"filter": "inbox"}
         )
-    system_prompt = (
-        "Analyse ces emails et réponds en JSON : "
-        "`summary` (string), `urgent` (array), `tasks` (array). "
-        "JSON brut uniquement, aucun texte avant ou après."
-    )
-    parsed = call_groq(system_prompt, emails_to_text(req.emails))
-    urgent = "\n".join([f"🔥 {u}" for u in parsed.get("urgent", [])]) or "Aucun"
-    tasks = "\n".join([f"✅ {t}" for t in parsed.get("tasks", [])]) or "Aucune"
-    return ChatResponse(
-        type="text",
-        text=f"📬 *Résumé de ta boîte mail*\n\n{parsed.get('summary','')}\n\n🔥 *Urgents*\n{urgent}\n\n✅ *Tâches*\n{tasks}"
-    )
+    try:
+        system_prompt = (
+            "Analyse ces emails et réponds en JSON : "
+            "`summary` (string), `urgent` (array), `tasks` (array). "
+            "JSON brut uniquement, aucun texte avant ou après."
+        )
+        parsed = call_groq(system_prompt, emails_to_text(req.emails))
+        urgent = "\n".join([f"🔥 {u}" for u in parsed.get("urgent", [])]) or "Aucun"
+        tasks = "\n".join([f"✅ {t}" for t in parsed.get("tasks", [])]) or "Aucune"
+        return ChatResponse(
+            type="text",
+            text=f"📬 *Résumé de ta boîte mail*\n\n{parsed.get('summary','')}\n\n🔥 *Urgents*\n{urgent}\n\n✅ *Tâches*\n{tasks}"
+        )
+    except Exception as e:
+        return ChatResponse(type="text", text=f"❌ Erreur lors de l'analyse : {str(e)}")
 
 
 def handle_important(req: ChatRequest) -> ChatResponse:
@@ -233,17 +313,20 @@ def handle_important(req: ChatRequest) -> ChatResponse:
             action="get_emails",
             action_data={"filter": "important"}
         )
-    system_prompt = (
-        "Identifie les emails vraiment importants (pas pubs ni newsletters). "
-        "Réponds en JSON : `summary` (string), `emails` (array de strings). "
-        "JSON brut uniquement."
-    )
-    parsed = call_groq(system_prompt, emails_to_text(req.emails))
-    emails_list = "\n".join([f"📌 {e}" for e in parsed.get("emails", [])]) or "Aucun email important"
-    return ChatResponse(
-        type="text",
-        text=f"⭐ *Emails importants*\n\n{parsed.get('summary','')}\n\n{emails_list}"
-    )
+    try:
+        system_prompt = (
+            "Identifie les emails vraiment importants (pas pubs ni newsletters). "
+            "Réponds en JSON : `summary` (string), `emails` (array de strings). "
+            "JSON brut uniquement."
+        )
+        parsed = call_groq(system_prompt, emails_to_text(req.emails))
+        emails_list = "\n".join([f"📌 {e}" for e in parsed.get("emails", [])]) or "Aucun email important"
+        return ChatResponse(
+            type="text",
+            text=f"⭐ *Emails importants*\n\n{parsed.get('summary','')}\n\n{emails_list}"
+        )
+    except Exception as e:
+        return ChatResponse(type="text", text=f"❌ Erreur : {str(e)}")
 
 
 def handle_search_start(chat_id: int) -> ChatResponse:
@@ -259,18 +342,21 @@ def handle_search(req: ChatRequest, query: str) -> ChatResponse:
             action="get_emails",
             action_data={"filter": query}
         )
-    system_prompt = (
-        f"Recherche les emails correspondant à : '{query}'. "
-        "Réponds en JSON : `results` (array de strings), `summary` (string). "
-        "JSON brut uniquement."
-    )
-    parsed = call_groq(system_prompt, emails_to_text(req.emails))
-    results = "\n".join([f"📧 {r}" for r in parsed.get("results", [])]) or "Aucun résultat"
-    save_session(req.chat_id, step="idle")
-    return ChatResponse(
-        type="text",
-        text=f"🔍 *Résultats pour \"{query}\"*\n\n{parsed.get('summary','')}\n\n{results}"
-    )
+    try:
+        system_prompt = (
+            f"Recherche les emails correspondant à : '{query}'. "
+            "Réponds en JSON : `results` (array de strings), `summary` (string). "
+            "JSON brut uniquement."
+        )
+        parsed = call_groq(system_prompt, emails_to_text(req.emails))
+        results = "\n".join([f"📧 {r}" for r in parsed.get("results", [])]) or "Aucun résultat"
+        save_session(req.chat_id, step="idle")
+        return ChatResponse(
+            type="text",
+            text=f"🔍 *Résultats pour \"{query}\"*\n\n{parsed.get('summary','')}\n\n{results}"
+        )
+    except Exception as e:
+        return ChatResponse(type="text", text=f"❌ Erreur : {str(e)}")
 
 
 def handle_reply_start(req: ChatRequest) -> ChatResponse:
@@ -317,28 +403,31 @@ def handle_reply_select(req: ChatRequest, session: dict) -> ChatResponse:
 
 def handle_reply_instruction(req: ChatRequest, session: dict) -> ChatResponse:
     selected = parse_session_json(session.get("selected_email"), {})
-    system_prompt = (
-        "Tu es un assistant email professionnel. Rédige une réponse email. "
-        "Réponds en JSON : `draft` (string, texte complet). JSON brut uniquement."
-    )
-    user_prompt = (
-        f"Email original :\nDe : {selected.get('from_') or selected.get('from', '')}\n"
-        f"Sujet : {selected.get('subject', '')}\nContenu : {selected.get('snippet', '')}\n\n"
-        f"Instruction : {req.message}"
-    )
-    parsed = call_groq(system_prompt, user_prompt)
-    draft = parsed.get("draft", "")
-    save_session(req.chat_id, step="reply_confirm", draft=draft)
-    return ChatResponse(
-        type="buttons",
-        text=f"📝 *Brouillon rédigé :*\n\n{draft}",
-        buttons=[[
-            {"text": "✅ Envoyer", "callback_data": "reply_confirm|yes"},
-            {"text": "❌ Annuler", "callback_data": "reply_confirm|no"}
-        ]],
-        action="confirm_reply",
-        action_data={"email_id": selected.get("id"), "draft": draft}
-    )
+    try:
+        system_prompt = (
+            "Tu es un assistant email professionnel. Rédige une réponse email. "
+            "Réponds en JSON : `draft` (string, texte complet). JSON brut uniquement."
+        )
+        user_prompt = (
+            f"Email original :\nDe : {selected.get('from_') or selected.get('from', '')}\n"
+            f"Sujet : {selected.get('subject', '')}\nContenu : {selected.get('snippet', '')}\n\n"
+            f"Instruction : {req.message}"
+        )
+        parsed = call_groq(system_prompt, user_prompt)
+        draft = parsed.get("draft", "")
+        save_session(req.chat_id, step="reply_confirm", draft=draft)
+        return ChatResponse(
+            type="buttons",
+            text=f"📝 *Brouillon rédigé :*\n\n{draft}",
+            buttons=[[
+                {"text": "✅ Envoyer", "callback_data": "reply_confirm|yes"},
+                {"text": "❌ Annuler", "callback_data": "reply_confirm|no"}
+            ]],
+            action="confirm_reply",
+            action_data={"email_id": selected.get("id"), "draft": draft}
+        )
+    except Exception as e:
+        return ChatResponse(type="text", text=f"❌ Erreur lors de la rédaction : {str(e)}")
 
 
 def handle_reply_confirm(req: ChatRequest, session: dict) -> ChatResponse:
@@ -369,11 +458,75 @@ def handle_today(req: ChatRequest) -> ChatResponse:
             action="get_calendar",
             action_data={"range": "today"}
         )
-    events_text = "\n".join([
-        f"- {e.get('summary', 'Sans titre')} à {e.get('start', '')}"
-        for e in req.events
-    ])
+    if not req.events:
+        return ChatResponse(type="text", text="📅 *Agenda du jour :*\n\nAucun événement aujourd'hui 🎉")
+
+    lines = []
+    for e in req.events:
+        title = e.get("summary", "Sans titre")
+        start = e.get("start", {})
+        # Handle both datetime and all-day events
+        if isinstance(start, dict):
+            time_str = start.get("dateTime", start.get("date", ""))
+        else:
+            time_str = str(start)
+        # Format time nicely if possible
+        try:
+            dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+            time_display = dt.strftime("%H:%M")
+        except Exception:
+            time_display = time_str
+        lines.append(f"🕐 *{time_display}* — {title}")
+
+    events_text = "\n".join(lines)
     return ChatResponse(
         type="text",
-        text=f"📅 *Agenda du jour :*\n\n{events_text or 'Aucun événement aujourd hui'}"
+        text=f"📅 *Agenda du jour :*\n\n{events_text}"
     )
+
+
+def handle_weather(city: str) -> ChatResponse:
+    try:
+        data = fetch_weather(city)
+        if data.get("cod") != 200:
+            return ChatResponse(type="text", text=f"❌ Ville introuvable : *{city}*")
+
+        name = data["name"]
+        country = data["sys"]["country"]
+        temp = round(data["main"]["temp"])
+        feels_like = round(data["main"]["feels_like"])
+        humidity = data["main"]["humidity"]
+        description = data["weather"][0]["description"].capitalize()
+        condition = data["weather"][0]["main"]
+        wind = round(data["wind"]["speed"] * 3.6)  # m/s → km/h
+        emoji = weather_emoji(condition)
+
+        text = (
+            f"{emoji} *Météo à {name}, {country}*\n\n"
+            f"🌡️ Température : *{temp}°C* (ressenti {feels_like}°C)\n"
+            f"💧 Humidité : {humidity}%\n"
+            f"💨 Vent : {wind} km/h\n"
+            f"🌥️ Ciel : {description}"
+        )
+        return ChatResponse(type="text", text=text)
+    except Exception as e:
+        return ChatResponse(type="text", text=f"❌ Erreur météo : {str(e)}")
+
+
+def handle_news(topic: str) -> ChatResponse:
+    try:
+        articles = fetch_news(topic=topic, lang="fr", max_results=5)
+        if not articles:
+            return ChatResponse(type="text", text="📰 Aucune actualité trouvée.")
+
+        header = f"📰 *Actualités{' sur ' + topic if topic else ' du jour'} :*\n\n"
+        lines = []
+        for i, a in enumerate(articles, start=1):
+            title = a.get("title", "Sans titre")
+            source = a.get("source", {}).get("name", "")
+            url = a.get("url", "")
+            lines.append(f"{i}. [{title}]({url})\n   _{source}_")
+
+        return ChatResponse(type="text", text=header + "\n\n".join(lines))
+    except Exception as e:
+        return ChatResponse(type="text", text=f"❌ Erreur news : {str(e)}")
